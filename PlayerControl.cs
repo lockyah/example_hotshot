@@ -1,319 +1,106 @@
 using System.Collections.Generic;
+using System.Collections;
 using System;
 using UnityEngine;
+using UnityEngine.InputSystem;
 
 public class PlayerControl : MonoBehaviour
 {
-    public static PlayerControl PC;
+    public enum PlayerStates { Idle, Run, Jump, WallSlide, Fall, Dodge, Hurt }
 
     public bool PlayerCanMove = true; //Enable or disable player inputs
-    public enum PlayerStates {Idle, Run, Jump, WallSlide, WallJump, Fall, Dodge, Hurt}
-    public PlayerStates CurrentState = PlayerStates.Idle;
-    public enum PlayerWeapons {Pistol, Bomb, Launcher, Whip, Joke}
-    public PlayerWeapons CurrentWeapon = PlayerWeapons.Pistol;
-    private float TimeSinceLastShot = 4.9f; //Weapon and idle pose cooldown
-
-    public float ImmobileTimer = 0f; //Dodging and wall jumping immobilise the player's horizontal movement
-    private float VertSpeed = -0.75f; //Current jump/gravity speed outside of multipliers
-    private float MaxGravity = -5f;
-    public float HorizMoveMultiplier = 1f; //Movement can be altered by environmental effects like water slowing horiz movement, or fans boosting jumps
-    public float VertMoveMultiplier = 1f;
-    private float MoveSpeed = 1f; //Increase to movement speed from dash/dash jumping
-    private float FallRate = 1f; //Increase to gravity from releasing jump or falling without jumping
-
-    public Vector3 MoveInput; //Direction to move in
-    public bool FacingRight = true;
-    public bool BadAim = false; //True if aiming behind on a wall slide or poking gun through a wall
-
     public Health PlayerHealth;
-    private CanvasController GameCanvas;
-    private CharacterController Control;
-    private GameObject WeaponAim, WeaponObject, WeaponEnd, Reticle, PSJump, PSLand, PSDust;
-    private ParticleSystem JumpPS, LandPS, DustPS;
-    private SpriteRenderer PlayerSprite;
-    private Animator PlayerAni;
+    private bool FacingRight;
+    public PlayerStates CurrentState = PlayerStates.Idle;
 
-    // Start is called before the first frame update
-    void Start()
+    public float HorizSpeed = 0; //Raw movement input
+    public float VertSpeed = -0.9f;
+    public Vector3 TeleportPosition = Vector3.zero; //Used when respawning or entering a new area
+
+    Vector3 ControlMove;
+    float HorizLockTimer = 0f; //Used on dash or wall jump to keep horizontal movement speed consistent
+    float MoveMultiplier, FallMultiplier = 1f;
+
+    GameObject Reticle, WeaponObject, WeaponAim;
+    ParseInputs Input;
+    CharacterController Control;
+    PlayerWeapons Weapons;
+    Animator PlayerAni;
+    SpriteRenderer PlayerSprite;
+
+    private void Start()
     {
-        //Singleton - player will always be needed!
-        if(PC == null)
+        WeaponAim = transform.Find("Player Aim").gameObject;
+        Cursor.visible = false;
+        Reticle = GameObject.Find("Player Reticle");
+        WeaponObject = GameObject.Find("Player Weapon Sprite");
+
+        PlayerHealth = GetComponent<Health>();
+        Input = GetComponent<ParseInputs>();
+        Control = GetComponent<CharacterController>();
+        Weapons = GetComponent<PlayerWeapons>();
+        PlayerAni = GetComponent<Animator>();
+        PlayerSprite = GameObject.Find("Player Sprite").GetComponent<SpriteRenderer>();
+
+        CutsceneDirector.CD.PlayerRef = this;
+        CutsceneDirector.CD.Input = Input;
+
+        if(LevelManager.LM.CheckpointIndex != -1)
         {
-            DontDestroyOnLoad(gameObject); //Player character will always be needed!
-            PC = this;
-
-            //Set up health according to save and apply it to the canvas
-            PlayerHealth = GetComponent<Health>();
-            GameCanvas = CanvasController.CC;
-            GameCanvas.SetCurrentHealth(PlayerHealth.CurrentHealth);
-            GameCanvas.SetMaxHealth(PlayerHealth.MaxHealth);
-
-            Control = GetComponent<CharacterController>();
-            PlayerAni = GetComponent<Animator>();
-
-            Cursor.visible = false;
-            Reticle = GameObject.Find("Player Reticle");
-
-            WeaponObject = GameObject.Find("Player Weapon Sprite");
-            WeaponAim = GameObject.Find("Player Aim");
-            WeaponEnd = GameObject.Find("Player Weapon End");
-            PSLand = GameObject.Find("PS Land");
-            PSJump = GameObject.Find("PS Jump");
-            PSDust = GameObject.Find("PS Dust");
-            JumpPS = PSJump.GetComponent<ParticleSystem>();
-            LandPS = PSLand.GetComponent<ParticleSystem>();
-            DustPS = PSDust.GetComponent<ParticleSystem>();
-
-            PlayerSprite = GameObject.Find("Player Sprite").GetComponent<SpriteRenderer>();
-        } else
-        {
-            Destroy(gameObject);
+            transform.position = LevelManager.LM.CheckpointPosition; //Can only directly set position in start, TeleportPosition needed any other time
+            FacingRight = LevelManager.LM.CheckpointFacingRight;
         }
+        LevelManager.LM.ResetCameraOnPlayer(); //Move camera to player on level intro
     }
 
-    void Update()
+    private void Update()
     {
-        if (PlayerCanMove && CurrentState != PlayerStates.Hurt)
+        if(Input.SwapLButton == ParseInputs.ButtonState.Pressed)
         {
-            HandleMoving();
-            HandleOrientation();
-            HandleWeapons();
+            LevelManager.LM.ReturnToCheckpoint();
+        }
+
+        if (PlayerCanMove)
+        {
+            HandleMove();
             HandleAnimations();
+            HandleWeapons();
         } else
         {
-            //!CanMove is when a cutscene is playing only, so handle gravity and moving cursor only
-            //Menus open sets timescale to 0 so nothing will move anyway
-            Control.Move(MoveInput * 5f * Time.deltaTime * Time.timeScale);
-            Reticle.transform.position = Input.mousePosition;
+            Control.Move(new Vector3(HorizSpeed * MoveMultiplier, VertSpeed, 0) * 5f * Time.deltaTime);
         }
 
-        UpdateTimers();
-        UpdateUI();
+        //Aiming should be done either way, but won't update aim direction if !PlayerCanMove
+        HandleAiming();
     }
 
-    void HandleMoving()
+    //CharacterController prevents direct transforming in Update, so it's done in LU instead
+    private void LateUpdate()
     {
-        if(!(CurrentState == PlayerStates.WallJump || CurrentState == PlayerStates.WallSlide || CurrentState == PlayerStates.Dodge))
+        if(TeleportPosition != Vector3.zero)
         {
-            if(ImmobileTimer <= 0)
-            {
-                //Take horiz inputs when not dodging or after wall jump
-                MoveInput.x = Mathf.Round(Input.GetAxisRaw("Horizontal")) * HorizMoveMultiplier * MoveSpeed; //Controller can input floats, so this is to keep it as raw input
-
-                if (ControllerGrounded())
-                {
-                    //Reset move speed if still on ground
-                    MoveSpeed = 1;
-                }
-            }
-            
-
-            if (ControllerGrounded())
-            {
-                //Grounded stuff
-
-                //Handle landing on ground
-                if (Control.isGrounded && VertSpeed != -0.9f)
-                {
-                    VertSpeed = -0.9f; //On landing, reset VertSpeed
-                    LandPS.Play(); //Play landing effect, automatically in correct position
-                    PlayerAni.SetFloat("WallSlideDirection", 0);
-                    FallRate = 1;
-                }
-
-                if (MoveInput.x != 0)
-                {
-                    CurrentState = PlayerStates.Run;
-                }
-                else
-                {
-                    CurrentState = PlayerStates.Idle;
-                }
-
-                if (Input.GetButtonDown("Dodge"))
-                {
-                    //If moving, dodge in move direction
-                    //If not, move in facing direction
-
-                    //Increase movement speed
-                    MoveSpeed = 2.25f;
-
-                    if (MoveInput.x != 0)
-                    {
-                        MoveInput.x = MoveSpeed * (MoveInput.x > 0 ? 1 : -1) * HorizMoveMultiplier;
-                    }
-                    else
-                    {
-                        MoveInput.x = MoveSpeed * (FacingRight ? 1 : -1) * HorizMoveMultiplier;
-                    }
-
-                    //Play dust effect from preset position
-                    PSDust.transform.localPosition = new Vector3(0, -1.159f, 0);
-                    DustPS.Play();
-
-                    ImmobileTimer = 0.33f;
-
-                    CurrentState = PlayerStates.Dodge;
-                }
-
-                if (Input.GetButtonDown("Jump"))
-                {
-                    VertSpeed = 1.75f;
-                    CurrentState = PlayerStates.Jump;
-
-                    //Play jump effect from preset position
-                    PSJump.transform.localPosition = new Vector3(0, -1.159f, 0);
-                    PSJump.transform.localEulerAngles = Vector3.zero;
-                    JumpPS.Play();
-                }
-            }
-            else
-            {
-                //Midair stuff
-
-                //Normal gravity effect
-                if (VertSpeed > MaxGravity)
-                {
-                    VertSpeed = MoveInput.y - (2.5f * Time.deltaTime) * FallRate;
-
-                    if (VertSpeed < MaxGravity)
-                    {
-                        VertSpeed = MaxGravity;
-                    }
-                }
-
-                //If jumping and release key or hit peak of jump, begin to fall faster
-                if((CurrentState == PlayerStates.Jump && Input.GetButtonUp("Jump")) || VertSpeed <= 0)
-                {
-                    CurrentState = PlayerStates.Fall;
-                    FallRate = 1.75f;
-                }
-            }
-
-        } else if(CurrentState == PlayerStates.Dodge)
-        {
-            //If out of time or inputting other direction, return to normal
-            //Falling off a ledge won't cancel!
-            if (ImmobileTimer <= 0 || (Input.GetAxisRaw("Horizontal") < 0 && MoveInput.x > 0) || (Input.GetAxisRaw("Horizontal") > 0 && MoveInput.x < 0))
-            {
-                ImmobileTimer = 0; //Exit dash if still moving
-
-                //Reset state, should automatically change if moving or jumping
-                CurrentState = PlayerStates.Idle;
-                MoveSpeed = 1f; //Return to normal speed
-
-                //Stop dust effect
-                DustPS.Stop();
-            } else
-            {
-                if (Input.GetButtonDown("Jump") && ControllerGrounded())
-                {
-                    ImmobileTimer = 0; //Exit dash if still moving
-                    MoveSpeed = 1.5f; //Decrease move speed slightly
-
-                    VertSpeed = 1.75f;
-                    CurrentState = PlayerStates.Jump;
-
-                    //Stop dust effect
-                    DustPS.Stop();
-
-                    //Play jump effect from preset position
-                    PSJump.transform.localPosition = new Vector3(0, -1.159f, 0);
-                    PSJump.transform.localEulerAngles = Vector3.zero;
-                    JumpPS.Play();
-                }
-                else if (Input.GetButtonDown("Dodge"))
-                {
-                    //Or input in opposite direction
-                    ImmobileTimer = 0.33f;
-                }
-            }
-
-        } else
-        {
-            //Wall Jump and Wall Slide
-
-            if(CurrentState == PlayerStates.WallSlide)
-            {
-                MoveInput.y = MaxGravity / 10 * VertMoveMultiplier;
-                VertSpeed = MoveInput.y;
-
-                FallRate = 1; //Reset gravity rate
-                MoveSpeed = 1; //Reset dash movement bonus
-
-
-                //If no longer in contact with a wall in midair, not holding toward the wall, or have hit the ground, reset wall slide direction for animator
-                if (Control.collisionFlags == CollisionFlags.None || Mathf.Round(Input.GetAxisRaw("Horizontal")) != PlayerAni.GetFloat("WallSlideDirection")*-1 || ControllerGrounded())
-                {
-                    DustPS.Stop();
-                    PlayerAni.SetFloat("WallSlideDirection", 0);
-                    CurrentState = PlayerStates.Idle; //Set to idle, will sort itself
-                }
-
-                if (Input.GetButtonDown("Jump"))
-                {
-                    CurrentState = PlayerStates.WallJump;
-                    DustPS.Stop();
-
-                    PSJump.transform.position = transform.position + new Vector3(PlayerAni.GetFloat("WallSlideDirection") == 1 ? -0.5f : 0.5f,0,0);
-                    PSJump.transform.localEulerAngles = new Vector3(0, 0, PlayerAni.GetFloat("WallSlideDirection") == 1 ? -90 : 90);
-                    JumpPS.Play();
-
-                    //Jump the direction of the normal and set gravity speed to a full jump
-                    MoveInput = new Vector3(PlayerAni.GetFloat("WallSlideDirection"), 1.75f, 0);
-                    VertSpeed = 1.75f;
-
-                    //Stop horizontal movement inputs for this amount of seconds
-                    ImmobileTimer = 0.33f;
-
-                    //Animation triggers
-                    PlayerAni.SetFloat("WallSlideDirection", 0);
-                }
-            } else
-            {
-                //Normal gravity effect
-                if (VertSpeed > MaxGravity)
-                {
-                    VertSpeed = MoveInput.y - (2.5f * Time.deltaTime) * FallRate;
-
-                    if (VertSpeed < MaxGravity)
-                    {
-                        VertSpeed = MaxGravity;
-                    }
-                }
-
-                //If jumping and release key or hit peak of jump, begin to fall faster
-                if (Input.GetButtonUp("Jump") || VertSpeed <= 0)
-                {
-                    CurrentState = PlayerStates.Fall;
-                    FallRate = 1.75f;
-                    ImmobileTimer = 0; //Exit jump
-                }
-                else if (ImmobileTimer <= 0)
-                {
-                    //Reset state
-                    CurrentState = PlayerStates.Fall;
-                }
-            }
-
+            //Player needs to be teleported somewhere, so set their position
+            transform.position = TeleportPosition;
+            TeleportPosition = Vector3.zero;
         }
 
-        MoveInput.y = VertSpeed * VertMoveMultiplier;
-
-        Control.Move(MoveInput * 5f * Time.deltaTime * Time.timeScale);
-
-        if(transform.position.z != 0)
+        //Course correction if geometry has pushed the player off of the z axis
+        if (transform.position.z != 0)
         {
-            transform.position = transform.position + new Vector3(0, 0, transform.position.z * -1);
-        }
+            transform.position = new Vector3(transform.position.x, transform.position.y, 0);
+        }    
     }
 
+
+    // ---------- UTILITY FUNCTIONS ----------
+
+
+    //Double-check the CharacterController's isGrounded parameter
     public bool ControllerGrounded()
     {
         bool result = Control.isGrounded;
-        
-        //If Phys doesn't think it's grounded, check with a raycast downward for normal coyote time
-        if(!result && VertSpeed <= -0.5f && Physics.Raycast(Control.bounds.center, Vector3.down, 1.5f,1<<0))
+
+        if (!result && VertSpeed <= -0.5f && Physics.Raycast(Control.bounds.center, Vector3.down, 1.5f, 1 << 0))
         {
             result = true;
         }
@@ -321,266 +108,294 @@ public class PlayerControl : MonoBehaviour
         return result;
     }
 
-    void HandleOrientation()
+    public void DamageKnockback(Vector2 pos)
     {
-        //Add check for control scheme in use to position aim
-        //When using a controller, this should be a constant distance from the player and rotate in a circle corresponding to the stick
-        WeaponAim.transform.position = Camera.main.ScreenToWorldPoint(Input.mousePosition + new Vector3(0, 0, 15));
-        Reticle.transform.position = Input.mousePosition;
+        //Called from Health when taking damage - applies a set knockback in the opposite direction of the damage source
+        PlayerCanMove = false;
 
-
-        //If only update aiming if reticle is far enough from the player and not paused
-        if(Vector3.Distance(transform.position, WeaponAim.transform.position) > 1f && Time.timeScale != 0)
+        if (!PlayerHealth.IsDead())
         {
-            float WallDirection = PlayerAni.GetFloat("WallSlideDirection");
-            Vector3 AimVector = Vector3.zero;
-
-            if (WallDirection != 0 && !ControllerGrounded())
+            if (Math.Abs(pos.x - transform.position.x) < 0.5f)
             {
-                //If wall sliding, use an alternate set of calculations
-                //Direction = normal of wall; 1 = on left side, -1 = on right
-
-                if((WallDirection == 1 && PlayerSprite.flipX) || (WallDirection == -1 && !PlayerSprite.flipX))
+                //If damage direction is too similar to player (i.e. above/below them), knock back in opposite of moving or aiming position
+                if (HorizSpeed != 0)
                 {
-                    InvertSprite();
+                    HorizSpeed = HorizSpeed < 0 ? 0.5f : -0.5f;
                 }
-
-                if((WallDirection == 1 && WeaponAim.transform.position.x > transform.position.x) || (WallDirection == -1 && WeaponAim.transform.position.x < transform.position.x))
+                else
                 {
-                    BadAim = false;
-                } else
-                {
-                    BadAim = true;
+                    HorizSpeed = !FacingRight ? 0.5f : -0.5f;
                 }
             }
             else
             {
-                BadAim = false; //Reset after jumping/leaving wall
-                AimVector = (WeaponAim.transform.position - WeaponObject.transform.position).normalized;
-
-                //Swap sprite facing and weapon arm position based on if aiming in front or behind the player
-                if ((WeaponAim.transform.position.x < transform.position.x && FacingRight) || (WeaponAim.transform.position.x > transform.position.x && !FacingRight))
-                {
-                    InvertSprite();
-                }
+                HorizSpeed = pos.x < transform.position.x ? 0.5f : -0.5f;
             }
 
-            //If player is aiming the wrong way on a wall/through a wall, or has been 5s since last shot, or weapon is already considered idle, use weapon idle pose
-            PlayerAni.SetBool("IdleWeapon", BadAim || TimeSinceLastShot >= 5f);
-            if (BadAim || TimeSinceLastShot >= 5f || PlayerAni.GetBool("IdleWeapon"))
-            {
-                if(WeaponAim.transform.position.x < transform.position.x)
-                {
-                    //Aiming to left.
-                    AimVector = ((WeaponObject.transform.position + new Vector3(-1, 0, 0) - WeaponObject.transform.position).normalized);
+            VertSpeed = -0.9f;
 
-                    if(WallDirection == 1)
-                    {
-                        AimVector.x *= -1;
-                    }
+            CurrentState = PlayerStates.Hurt;
 
-                } else if(WeaponAim.transform.position.x > transform.position.x)
-                {
-                    //Aiming to right
-                    AimVector = ((WeaponObject.transform.position + new Vector3(1, 0, 0) - WeaponObject.transform.position).normalized);
-
-                    if (WallDirection == -1)
-                    {
-                        AimVector.x *= -1;
-                    }
-                }
-            } else
-            {
-                //Normal aiming
-                AimVector = (WeaponAim.transform.position - WeaponObject.transform.position).normalized;
-            }
-
-            //Use the vector to update aiming angle
-            WeaponObject.transform.localEulerAngles = new Vector3(0, 0, Mathf.Atan2(AimVector.y, AimVector.x) * Mathf.Rad2Deg);
-        }        
+            StartCoroutine(KnockbackCR());
+        } else
+        {
+            //WIP - death state!
+        }
     }
 
-    private void InvertSprite()
+    IEnumerator KnockbackCR()
     {
-        FacingRight = !FacingRight;
-        PlayerSprite.flipX = !PlayerSprite.flipX;
-        WeaponEnd.transform.localPosition = new Vector3(WeaponEnd.transform.localPosition.x, WeaponEnd.transform.localPosition.y * -1, 0);
-    }
+        //Damage invincibility gives 1.5 seconds, so this control should be regained slightly earlier to allow moving out of the way
+        yield return new WaitForSeconds(0.75f);
 
-    public void HandleWeapons()
-    {
-        //Check for changing weapons first so they don't fire the wrong ammo
-        //Change where WeaponEnd is per weapon, add a flip at the end by checking FacingRight
-        //Can't change during weapon cooldown or while pressing/holding a button
-
-        //Can only change to weapons that are unlocked
-
-        if (!BadAim)
-        {
-            switch (CurrentWeapon)
-            {
-                case PlayerWeapons.Pistol:
-                    //Mega Buster basic weapon. Fires on clicks, between cooldowns, only when not dodging.
-                    if (TimeSinceLastShot >= 0.1f && Input.GetButtonDown("Fire1") && CurrentState != PlayerStates.Dodge)
-                    {
-
-                        GameObject bullet = ObjectPooler.OP.RequestPoolItem("Bullet");
-
-                        if (bullet != null)
-                        {
-                            //Shoot on each press if after cooldown
-                            TimeSinceLastShot = 0;
-
-                            //Replicate aiming mechanic
-                            Vector3 AimVector = (WeaponAim.transform.position - WeaponObject.transform.position).normalized;
-                            //Use the vector to update aiming angle
-                            WeaponObject.transform.localEulerAngles = new Vector3(0, 0, Mathf.Atan2(AimVector.y, AimVector.x) * Mathf.Rad2Deg);
-
-                            bullet.GetComponent<WPN_Bullet>().SetData(PlayerHealth.GetHealthType(), 2);
-                            bullet.SetActive(true);
-                            bullet.transform.position = WeaponEnd.transform.position;
-                            bullet.transform.rotation = WeaponObject.transform.localRotation;
-
-                            PlayerAni.SetTrigger("PrimaryFire");
-                        }
-                    }
-
-                    //Secondary function can happen at same time as firing or dodging
-                    if (Input.GetButtonDown("Fire2"))
-                    {
-                        Debug.Log("Secondary begun!");
-                    }
-                    else if (Input.GetButtonUp("Fire2"))
-                    {
-                        Debug.Log("Secondary ended!");
-                    }
-                    break;
-                default:
-                    //Unknown or unprogrammed weapon, somehow. Only display error on press.
-                    if (Input.GetButtonDown("Fire1") || Input.GetButtonDown("Fire2"))
-                    {
-                        Debug.Log("No behaviour listed for this weapon!");
-                    }
-                    break;
-            }
-        }
-
-        
-
-        //if !Fire2 to recharge special meter slowly
-    }
-
-    void UpdateTimers()
-    {
-        //Timer to return to weapon idle pose
-        if (TimeSinceLastShot < 5f)
-        {
-            TimeSinceLastShot += Time.deltaTime * Time.timeScale;
-        }
-
-        if(ImmobileTimer > 0)
-        {
-            ImmobileTimer -= Time.deltaTime;
-
-            if(CurrentState == PlayerStates.Hurt)
-            {
-                CurrentState = PlayerStates.Idle;
-            }
-        }
-        
-    }
-
-    void UpdateUI()
-    {
-        //Use the CanvasController to update health, ammo, chosen weapon, etc.
-
-        if (PlayerHealth.MaxHealth != GameCanvas.GetMaxHealth())
-        {
-            GameCanvas.SetMaxHealth(PlayerHealth.MaxHealth);
-        }
-
-        if(PlayerHealth.CurrentHealth != GameCanvas.GetCurrentHealth())
-        {
-            GameCanvas.SetCurrentHealth(PlayerHealth.CurrentHealth);
-        }
-
-        //Add update for special meter when implemented
+        CurrentState = PlayerStates.Idle; //Return to idle, main movement will handle it from here!
+        PlayerCanMove = true;
     }
 
     void HandleAnimations()
     {
-        PlayerAni.SetFloat("HorizSpeed", MoveInput.x);
+        PlayerAni.SetFloat("HorizSpeed", ControlMove.x);
+        PlayerAni.SetFloat("VertSpeed", VertSpeed);
         PlayerAni.SetInteger("CurrentState", (int)CurrentState);
         PlayerAni.SetBool("FacingRight", FacingRight);
+        PlayerAni.SetBool("IdleWeapon", Weapons.WeaponIdle());
     }
 
-    //Called after taking damage with the origin of the collision - used to apply knockback
-    public void TakeDamage(Vector3 vect)
+    private void InvertSprite()
     {
-        //Z = damage since axis is unused
-        PlayerHealth.ChangeHealth((int)-vect.z);
-        vect.z = 0;
+        PlayerSprite.flipX = !PlayerSprite.flipX;
+        Weapons.WeaponEnd.transform.localPosition = new Vector3(Weapons.WeaponEnd.transform.localPosition.x, Weapons.WeaponEnd.transform.localPosition.y * -1, 0);
+    }
 
-        if (!PlayerHealth.IsDead())
+
+    // ---------- MAIN FUNCTIONS ----------
+
+
+    //Calculates move direction to handle CharacterController movement
+    void HandleMove()
+    {
+        if (!(CurrentState == PlayerStates.WallSlide || CurrentState == PlayerStates.Dodge))
         {
-            CurrentState = PlayerStates.Hurt;
-            ImmobileTimer = 0.5f;
+            if(HorizLockTimer <= 0)
+            {
+                if(ControllerGrounded() && MoveMultiplier != 1)
+                {
+                    MoveMultiplier = 1f;
+                }
 
-            Debug.Log("Took damage from direction " + vect);
+                //Always update input on keyboard, listen for Aim Button on gamepad
+                if ((Input.CurrentControls == "Gamepad" && !(Input.AimButton == ParseInputs.ButtonState.Pressed || Input.AimButton == ParseInputs.ButtonState.Down)) || Input.CurrentControls == "Keyboard&Mouse")
+                {
+                    HorizSpeed = Mathf.Round(Input.LeftStick.x);
+                }
+            } else
+            {
+                HorizLockTimer -= Time.deltaTime * Time.deltaTime;
+            }
+            
 
-            MoveInput = transform.position - vect;
-            VertSpeed = MoveInput.y;
-            FallRate = 1f;
+            if (ControllerGrounded())
+            {
+                //GROUNDED - idle, run, hurt(?)
+
+                //On landing, reset falling speed
+                if (Control.isGrounded && VertSpeed != -0.9f)
+                {
+                    VertSpeed = -0.9f;
+                    FallMultiplier = 1;
+                    HorizLockTimer = 0f; //Reset wall jump/dodge timer
+                }
+
+                CurrentState = HorizSpeed != 0 ? PlayerStates.Run : PlayerStates.Idle;
+
+                if(Input.DashButton == ParseInputs.ButtonState.Pressed && CurrentState != PlayerStates.Hurt)
+                {
+                    MoveMultiplier = 2.25f;
+                    HorizLockTimer = 0.33f;
+                    CurrentState = PlayerStates.Dodge;
+
+                    if(HorizSpeed == 0)
+                    {
+                        //Move in aim direction if not moving
+                        HorizSpeed = WeaponAim.transform.position.x < transform.position.x ? -1 : 1;
+                    }
+                }
+
+                if (Input.JumpButton == ParseInputs.ButtonState.Pressed && CurrentState != PlayerStates.Hurt)
+                {
+
+                    if (CurrentState == PlayerStates.Dodge)
+                    {
+                        //If also dashing this frame, move straight to dash-jump speed
+                        ControlMove.x /= MoveMultiplier;
+                        MoveMultiplier = 1.5f;
+                        HorizLockTimer = 0f;
+                    }
+                    
+                    VertSpeed = 1.75f;
+                    FallMultiplier = 1;
+                    CurrentState = PlayerStates.Jump;
+                }
+
+            } else
+            {
+                //MIDAIR - jump, fall
+
+                if (VertSpeed > -5f)
+                {
+                    VertSpeed -= (3f * Time.deltaTime) * FallMultiplier;
+
+                    if (VertSpeed < -5f)
+                    {
+                        VertSpeed = -5f;
+                    }
+                }
+
+                //If jumping and release key or hit peak of jump, begin to fall faster
+                if ((CurrentState == PlayerStates.Jump && Input.JumpButton == ParseInputs.ButtonState.Released) || VertSpeed <= 0)
+                {
+                    CurrentState = PlayerStates.Fall;
+                    FallMultiplier = 1.75f;
+                    HorizLockTimer = 0f; //Reset wall jump/dodge timer
+                }
+            }
+
         } else
         {
-            Debug.Log("DEAD");
-            ImmobileTimer = 99f;
-            MoveInput = Vector3.zero;
-            PlayerCanMove = false;
+            if(CurrentState == PlayerStates.WallSlide)
+            {
 
-            LevelManager.LM.ReturnToCheckpoint();
+            } else
+            {
+                //DODGE
+
+                if(HorizLockTimer <= 0)
+                {
+                    MoveMultiplier = 1f;
+                    CurrentState = PlayerStates.Idle;
+                } else
+                {
+                    HorizLockTimer -= Time.deltaTime * Time.timeScale;
+
+                    //Continually move in same direction that dash started in, unless input (without aim lock) is in the other direction
+                    if(Mathf.Round(Input.LeftStick.x) == HorizSpeed * -1 && !(Input.AimButton == ParseInputs.ButtonState.Pressed || Input.AimButton == ParseInputs.ButtonState.Down))
+                    {
+                        HorizLockTimer = 0f;
+                        CurrentState = PlayerStates.Idle;
+                        MoveMultiplier = 1f;
+                    } else if (Input.JumpButton == ParseInputs.ButtonState.Pressed && CurrentState != PlayerStates.Hurt && ControllerGrounded())
+                    {
+                        VertSpeed = 1.75f;
+                        MoveMultiplier = 1.5f;
+                        FallMultiplier = 1f;
+                        HorizLockTimer = 0f;
+                        CurrentState = PlayerStates.Jump;
+                    } else if(Input.DashButton == ParseInputs.ButtonState.Pressed && ControllerGrounded())
+                    {
+                        HorizLockTimer = 0.33f;
+
+                        //Check to see if the player changed direction
+                        if ((Input.CurrentControls == "Gamepad" && !(Input.AimButton == ParseInputs.ButtonState.Pressed || Input.AimButton == ParseInputs.ButtonState.Down)) || Input.CurrentControls == "Keyboard&Mouse")
+                        {
+                            HorizSpeed = Mathf.Round(Input.LeftStick.x);
+                        }
+                    }
+                }
+            }
+        }
+
+        ControlMove.x = HorizSpeed * MoveMultiplier;
+        ControlMove.y = VertSpeed;
+
+        Control.Move(ControlMove * 5f * Time.deltaTime);
+    }
+
+    void HandleAiming()
+    {
+        if (Input.CurrentControls == "Keyboard&Mouse")
+        {
+            //Directly tie to cursor position
+            WeaponAim.transform.position = Camera.main.ScreenToWorldPoint(new Vector3(Mouse.current.position.ReadValue().x, Mouse.current.position.ReadValue().y, -Camera.main.transform.position.z));
+        }
+        else
+        {
+            //Link to same stick as movement
+            Vector2 direction = Input.LeftStick;
+
+            if (direction.magnitude > 0.5)
+            {
+                direction = direction / direction.magnitude;
+                WeaponAim.transform.localPosition = direction * Camera.main.transform.position.z / -3;
+            }
+        }
+
+        //Update aim direction if not overlapping the player character and movement is enabled
+        if (Vector3.Distance(transform.position, WeaponAim.transform.position) > 1f && PlayerCanMove)
+        {
+            if (WeaponAim.transform.position.x < transform.position.x)
+            {
+                FacingRight = false;
+            }
+            else
+            {
+                FacingRight = true;
+            }
+
+            //Use the vector to update aiming angle
+            Vector2 AimVector = (WeaponAim.transform.position - WeaponObject.transform.position).normalized;
+
+
+            if (Weapons.WeaponIdle())
+            {
+                WeaponObject.transform.localEulerAngles = new Vector3(0, 0, Mathf.Atan2(0, FacingRight ? 1 : -1) * Mathf.Rad2Deg);
+            }
+            else
+            {
+                WeaponObject.transform.localEulerAngles = new Vector3(0, 0, Mathf.Atan2(AimVector.y, AimVector.x) * Mathf.Rad2Deg);
+            }
+
+        } else if (!PlayerCanMove)
+        {
+            //If in a cutscene, still handle idle weapons
+            if (Weapons.WeaponIdle())
+            {
+                WeaponObject.transform.localEulerAngles = new Vector3(0, 0, Mathf.Atan2(0, FacingRight ? 1 : -1) * Mathf.Rad2Deg);
+                PlayerAni.SetBool("IdleWeapon", true);
+            }
+        }
+
+        if ((FacingRight && PlayerSprite.flipX) || (!FacingRight && !PlayerSprite.flipX))
+        {
+            InvertSprite();
+        }
+
+        Reticle.transform.position = Camera.main.WorldToScreenPoint(WeaponAim.transform.position);
+    }
+
+    void HandleWeapons()
+    {
+        if(CurrentState != PlayerStates.Dodge && CurrentState != PlayerStates.Hurt)
+        {
+            switch (Weapons.CurrentWeapon)
+            {
+                case PlayerWeapons.WeaponType.Pistol:
+                    Weapons.Pistol(Input.PrimaryButton);
+                    break;
+            }
         }
     }
 
     private void OnControllerColliderHit(ControllerColliderHit hit)
     {
-        if (PlayerCanMove)
+        if (!ControllerGrounded())
         {
-            if(CurrentState == PlayerStates.WallSlide && !(hit.normal.x == -1 || hit.normal.x == 1) && hit.gameObject.layer == 0)
+            if (VertSpeed > 0 && Control.collisionFlags == CollisionFlags.Above)
             {
-                //If sliding on a wall that isn't flat, end slide
-                CurrentState = PlayerStates.Idle;
-                PlayerAni.SetFloat("WallSlideDirection", 0);
+                //Stop jumps if the player hits something above them
 
-                DustPS.Stop();
-            }
-
-            if (!ControllerGrounded() && Control.collisionFlags == CollisionFlags.Above)
-            {
-                //If in midair and hit something above, invert vertical speed
-                if (VertSpeed > 0)
-                {
-                    VertSpeed = -VertSpeed;
-                }
-
-                MoveInput.y = VertSpeed;
-            }
-            else if (!Physics.Raycast(transform.position,Vector3.down,3f) && !ControllerGrounded() && (hit.normal.x == -1 || hit.normal.x == 1) && hit.gameObject.layer != 6)
-            {
-                //Can't wall slide if too close to ground
-                //Normals used to ensure flat walls only
-                //Layer 6 is for unclimbable surfaces
-
-                if ((Mathf.Round(Input.GetAxisRaw("Horizontal")) < 0 && hit.normal.x > 0) || (Mathf.Round(Input.GetAxisRaw("Horizontal")) > 0 && hit.normal.x < 0))
-                {
-                    //If inputting toward the wall, trigger wall slide state and save which side the wall is
-                    CurrentState = PlayerStates.WallSlide;
-                    PlayerAni.SetFloat("WallSlideDirection", hit.normal.x);
-
-                    //Play dust effect from preset position
-                    PSDust.transform.localPosition = new Vector3(-0.665f * hit.normal.x, -0.653f, 0);
-                    DustPS.Play();
-                }
+                VertSpeed = 0;
+                FallMultiplier = 1.75f;
+                CurrentState = PlayerStates.Fall;
             }
         }
     }
