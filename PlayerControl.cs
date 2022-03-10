@@ -44,6 +44,7 @@ public class PlayerControl : MonoBehaviour
 
         CutsceneDirector.CD.PlayerRef = this;
         CutsceneDirector.CD.Input = Input;
+        CanvasController.CC.PromptAnchor = transform.GetChild(1); //"Camera Track" object
 
         if(LevelManager.LM.CheckpointIndex != -1)
         {
@@ -63,15 +64,15 @@ public class PlayerControl : MonoBehaviour
         if (PlayerCanMove)
         {
             HandleMove();
-            HandleAnimations();
             HandleWeapons();
         } else
         {
-            Control.Move(new Vector3(HorizSpeed * MoveMultiplier, VertSpeed, 0) * 5f * Time.deltaTime);
+            Control.Move(new Vector3(HorizSpeed * MoveMultiplier, VertSpeed * FallMultiplier, 0) * 5f * Time.deltaTime);
         }
 
-        //Aiming should be done either way, but won't update aim direction if !PlayerCanMove
+        //Aiming and animation should be done either way, but won't update aim direction if !PlayerCanMove
         HandleAiming();
+        HandleAnimations();
     }
 
     //CharacterController prevents direct transforming in Update, so it's done in LU instead
@@ -112,34 +113,43 @@ public class PlayerControl : MonoBehaviour
     {
         //Called from Health when taking damage - applies a set knockback in the opposite direction of the damage source
         PlayerCanMove = false;
+        CurrentState = PlayerStates.Hurt; //Health value determines whether this is a hurt state or a death state
 
-        if (!PlayerHealth.IsDead())
+        //Find direction of damage so that knockback effects can use it
+        if (Math.Abs(pos.x - transform.position.x) < 0.5f)
         {
-            if (Math.Abs(pos.x - transform.position.x) < 0.5f)
+            //If damage direction is too similar to player (i.e. above/below them), knock back in opposite of moving or aiming position
+            if (HorizSpeed != 0)
             {
-                //If damage direction is too similar to player (i.e. above/below them), knock back in opposite of moving or aiming position
-                if (HorizSpeed != 0)
-                {
-                    HorizSpeed = HorizSpeed < 0 ? 0.5f : -0.5f;
-                }
-                else
-                {
-                    HorizSpeed = !FacingRight ? 0.5f : -0.5f;
-                }
+                HorizSpeed = HorizSpeed < 0 ? 0.5f : -0.5f;
             }
             else
             {
-                HorizSpeed = pos.x < transform.position.x ? 0.5f : -0.5f;
+                HorizSpeed = !FacingRight ? 0.5f : -0.5f;
             }
+        }
+        else
+        {
+            HorizSpeed = pos.x < transform.position.x ? 0.5f : -0.5f;
+        }
 
+        if((HorizSpeed > 0 && FacingRight) || (HorizSpeed < 0 && !FacingRight))
+        {
+            //Turn to face damage source
+            InvertSprite();
+        }
+
+        //If not dead, revert to normal gravity (Fall state can handle speed later)
+        //If dead, coroutine handles vertical speed for the effect
+        if (!PlayerHealth.IsDead())
+        {
             VertSpeed = -0.9f;
-
-            CurrentState = PlayerStates.Hurt;
-
+            FallMultiplier = 1f;
             StartCoroutine(KnockbackCR());
         } else
         {
-            //WIP - death state!
+            //Disable ability to use pause menu here!
+            StartCoroutine(DeathKnockbackCR());
         }
     }
 
@@ -152,6 +162,50 @@ public class PlayerControl : MonoBehaviour
         PlayerCanMove = true;
     }
 
+    IEnumerator DeathKnockbackCR()
+    {
+        //From impact, slow time for a second, then rise and gradually speed up
+        Time.timeScale = 0.05f;
+        HorizSpeed *= 2f;
+        VertSpeed = 1.75f;
+        yield return new WaitForSecondsRealtime(1f);
+        
+        while(Time.timeScale < 1f)
+        {
+            Time.timeScale += Time.deltaTime * 3f;
+            VertSpeed -= Time.deltaTime * 3f;
+            yield return new WaitForEndOfFrame();
+        }
+
+        float TimeOut = 0f;
+
+        while (!ControllerGrounded())
+        {
+            VertSpeed -= Time.deltaTime * 6f;
+            TimeOut += Time.deltaTime;
+
+            //Fade out if falling for long enough without hitting the ground
+            if(TimeOut >= 5f)
+            {
+                break;
+            } else
+            {
+                yield return new WaitForEndOfFrame();
+            }
+        }
+
+        if (ControllerGrounded())
+        {
+            HorizSpeed = 0;
+            VertSpeed = 0;
+        }
+
+        //Fade out animation
+        yield return new WaitForSecondsRealtime(3f);
+
+        LevelManager.LM.ReturnToCheckpoint();
+    }
+
     void HandleAnimations()
     {
         PlayerAni.SetFloat("HorizSpeed", ControlMove.x);
@@ -159,6 +213,7 @@ public class PlayerControl : MonoBehaviour
         PlayerAni.SetInteger("CurrentState", (int)CurrentState);
         PlayerAni.SetBool("FacingRight", FacingRight);
         PlayerAni.SetBool("IdleWeapon", Weapons.WeaponIdle());
+        PlayerAni.SetBool("Dead", PlayerHealth.IsDead());
     }
 
     private void InvertSprite()
@@ -393,9 +448,15 @@ public class PlayerControl : MonoBehaviour
             {
                 //Stop jumps if the player hits something above them
 
+                print("bonk");
+
                 VertSpeed = 0;
                 FallMultiplier = 1.75f;
-                CurrentState = PlayerStates.Fall;
+
+                if(CurrentState != PlayerStates.Hurt)
+                {
+                    CurrentState = PlayerStates.Fall;
+                }
             }
         }
     }

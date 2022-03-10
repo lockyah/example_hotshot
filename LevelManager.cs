@@ -52,6 +52,10 @@ public class LevelManager : MonoBehaviour
     public void ReturnToCheckpoint()
     {
         Debug.Log("Respawning!");
+
+        //Add UI animation for fading to black and back again
+
+        CanvasController.CC.SetCurrentHealth(CanvasController.CC.GetMaxHealth());
         SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
     }
 }
